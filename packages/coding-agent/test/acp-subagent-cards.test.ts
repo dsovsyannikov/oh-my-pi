@@ -163,6 +163,23 @@ describe("supervisor summary", () => {
 	});
 });
 
+describe("child-session mode (emitCards: false)", () => {
+	it("updates state silently while the supervisor rollup stays live", () => {
+		const tracker = new SubagentCardTracker({ emitCards: false });
+		expect(tracker.sync(SESSION, [progressRow()])).toHaveLength(0);
+		expect(tracker.supervisorSummary()).toEqual({ active: 1, tokens: 4200, focus: "scout: reading files" });
+		expect(tracker.finalizeFromResults(SESSION, [resultRow()])).toHaveLength(0);
+		expect(tracker.supervisorSummary()).toBeUndefined();
+	});
+
+	it("aborts state without emitting", () => {
+		const tracker = new SubagentCardTracker({ emitCards: false });
+		tracker.sync(SESSION, [progressRow()]);
+		expect(tracker.abortAll(SESSION)).toHaveLength(0);
+		expect(tracker.supervisorSummary()).toBeUndefined();
+	});
+});
+
 describe("task call titles", () => {
 	it("titles a flat spawn", () => {
 		const update = buildToolCallStartUpdate({

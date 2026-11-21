@@ -61,7 +61,7 @@ import { MCPManager } from "../../mcp/manager";
 import { reconnectMcpManagerServer } from "../../mcp/oauth-reauth";
 import type { MCPServerConfig } from "../../mcp/types";
 import { loadAllExtensions } from "../../modes/components/extensions/state-manager";
-import { AgentRegistry } from "../../registry/agent-registry";
+import { AgentRegistry, type AgentRef } from "../../registry/agent-registry";
 import { registerPersistedSubagents } from "../../registry/persisted-agents";
 import type { AgentCostSnapshot } from "@oh-my-pi/pi-tui/overlays/agent-hub-projection";
 import { SessionObserverRegistry } from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
@@ -110,7 +110,7 @@ import {
 	mapAgentSessionEventToAcpSessionUpdates,
 	normalizeReplayToolArguments,
 } from "./acp-event-mapper";
-import { formatTokens, SubagentCardTracker } from "./acp-subagent-cards";
+import { extractSubagentProgressRows, formatTokens, SubagentCardTracker } from "./acp-subagent-cards";
 import { ACP_TERMINAL_AUTH_FLAG } from "./terminal-auth";
 
 import { cfgDisabledExtensions, cfgExtensions } from "../../extensibility/settings";
@@ -415,6 +415,9 @@ type ManagedSessionRecord = {
 	// and the last status title pushed for it (see #deliverSupervisorTitle).
 	titleBase: string | undefined;
 	lastSupervisorTitle: string | undefined;
+	// Live ACP child sessions (Subagent Sessions RFD), keyed by registry agent id.
+	childSessions: Map<string, ChildSessionState>;
+	registryUnsubscribe: (() => void) | undefined;
 	extensionsConfigured: boolean;
 	// Capture at registration, independently of prompt turns. Delivery opens
 	// after the bootstrap guard or a client prompt proves the session is known.
@@ -425,6 +428,18 @@ type ManagedSessionRecord = {
 	closedError: RequestError | undefined;
 	promptEventHandlers: Set<Promise<void>>;
 	extensionUserMessageTasks: Set<Promise<void>>;
+};
+
+/** One announced live child session (Subagent Sessions RFD) owned by a managed record. */
+type ChildSessionState = {
+	/** Client-visible child sessionId (`subagent:<agentId>`); announced before any child traffic. */
+	readonly protocolSessionId: string;
+	readonly agentId: string;
+	/** Cards for this child's own nested task spawns, streamed inside the child session. */
+	tracker: SubagentCardTracker;
+	toolArgsById: Map<string, unknown>;
+	unsubscribeEvents: (() => void) | undefined;
+	unsubscribeRunState: (() => void) | undefined;
 };
 
 type ReplayableMessage = {
@@ -1021,6 +1036,8 @@ export class AcpAgent implements Agent {
 	#initialSession: AgentSession | undefined;
 	#createSession: CreateAcpSession;
 	#sessions = new Map<string, ManagedSessionRecord>();
+	/** Child-session routing for `session/cancel`: child protocol id → owning record. */
+	#childSessionsByProtocolId = new Map<string, ManagedSessionRecord>();
 	/** Serializes writes of the handle map ({@link readAcpSessionHandles}). */
 	#handleWrites: Promise<void> = Promise.resolve();
 	#disposePromise: Promise<void> | undefined;
@@ -1562,6 +1579,18 @@ export class AcpAgent implements Agent {
 	}
 
 	async cancel(params: { sessionId: string }): Promise<void> {
+		// Children are cancelled by aborting the child's own session, never by
+		// tearing down the parent turn.
+		const childOwnerRecord = this.#childSessionsByProtocolId.get(params.sessionId);
+		if (childOwnerRecord) {
+			for (const [agentId, child] of childOwnerRecord.childSessions) {
+				if (child.protocolSessionId !== params.sessionId) continue;
+				AgentRegistry.global()
+					.get(agentId)
+					?.session?.abort({ goalReason: "interrupted" });
+				return;
+			}
+		}
 		const record = this.#getSessionRecord(params.sessionId);
 		// Settle the subagent cards: cancelled sync children never get to report
 		// their aborted status (the prompt-turn subscription is torn down first), so
@@ -1972,6 +2001,7 @@ export class AcpAgent implements Agent {
 		protocolSessionId = session.sessionId,
 	): Promise<ManagedSessionRecord> {
 		const record = this.#createManagedSessionRecord(session, setToolUIContext, protocolSessionId);
+		this.#wireSubagentRegistry(record);
 		// Registered before extensions start: a `session_start` handler can already replace the durable session.
 		session.registerSessionChangeCallback(() => this.#rememberHandleSession(record));
 		session.setClientBridge({
@@ -2017,9 +2047,11 @@ export class AcpAgent implements Agent {
 			liveMessageId: undefined,
 			liveMessageProgress: undefined,
 			toolArgsById: new Map(),
-			subagentCards: new SubagentCardTracker(),
+			subagentCards: new SubagentCardTracker({ emitCards: !this.#childSessionsEnabled }),
 			titleBase: undefined,
 			lastSupervisorTitle: undefined,
+			childSessions: new Map(),
+			registryUnsubscribe: undefined,
 			extensionsConfigured: false,
 			closedError: undefined,
 			promptEventHandlers: new Set(),
@@ -2057,6 +2089,129 @@ export class AcpAgent implements Agent {
 				update: { sessionUpdate: "session_info_update", title: desired },
 			}),
 		);
+	}
+
+	// --- Child sessions (ACP Subagent Sessions RFD) --------------------------------
+
+	get #childSessionsEnabled(): boolean {
+		return this.#clientCapabilities?.subagents != null;
+	}
+
+	/** True when `ref` is a direct task child of this session's own agent tree. */
+	#isManagedChildAgent(record: ManagedSessionRecord, ref: AgentRef): boolean {
+		return ref.kind === "sub" && ref.parentId !== undefined && ref.parentId === record.session.getAgentId();
+	}
+
+	/**
+	 * Follow the process-global agent registry: every task child of this session
+	 * becomes an announced ACP child session whose messages and tool calls stream
+	 * on the child's own sessionId (the client renders them as subagent cards).
+	 * Registry events mirror status transitions into `subagent_update` patches on
+	 * the parent session; without the client's `subagents` capability nothing is
+	 * announced and the phase-1 cards path stays active instead.
+	 */
+	#wireSubagentRegistry(record: ManagedSessionRecord): void {
+		record.registryUnsubscribe = AgentRegistry.global().onChange(event => {
+			if (event.type === "removed") {
+				this.#detachChildSession(record, event.ref.id);
+				return;
+			}
+			if (this.#isManagedChildAgent(record, event.ref)) {
+				this.#syncChildSession(record, event.ref);
+			}
+		});
+		// A session loaded from history can already have live children registered.
+		for (const ref of AgentRegistry.global().list()) {
+			if (this.#isManagedChildAgent(record, ref)) this.#syncChildSession(record, ref);
+		}
+	}
+
+	/** Wire or refresh one child session from a registry ref (idempotent per agent id). */
+	#syncChildSession(record: ManagedSessionRecord, ref: AgentRef): void {
+		if (!this.#childSessionsEnabled) return;
+		let child = record.childSessions.get(ref.id);
+		if (!child) {
+			child = {
+				protocolSessionId: `subagent:${ref.id}`,
+				agentId: ref.id,
+				tracker: new SubagentCardTracker(),
+				toolArgsById: new Map(),
+				unsubscribeEvents: undefined,
+				unsubscribeRunState: undefined,
+			};
+			record.childSessions.set(ref.id, child);
+			this.#childSessionsByProtocolId.set(child.protocolSessionId, record);
+		}
+		this.#announceChild(record, ref);
+		if (ref.session && !child.unsubscribeEvents) {
+			this.#wireChildSession(record, ref, child);
+		} else if (!ref.session && child.unsubscribeEvents) {
+			// Parked/detached: the run stopped streaming. The announce above already
+			// settled the card state; stop listening until a revival re-attaches.
+			child.unsubscribeEvents();
+			child.unsubscribeEvents = undefined;
+			child.unsubscribeRunState?.();
+			child.unsubscribeRunState = undefined;
+		}
+	}
+
+	#announceChild(record: ManagedSessionRecord, ref: AgentRef, runState?: "running" | "idle"): void {
+		const child = record.childSessions.get(ref.id);
+		if (!child) return;
+		const state = runState ?? (ref.status === "running" ? ("running" as const) : ("idle" as const));
+		const title = ref.activity ? `${ref.displayName} — ${ref.activity}` : ref.displayName;
+		const update: SessionUpdate = {
+			sessionUpdate: "subagent_update",
+			sessionId: child.protocolSessionId,
+			title,
+			capabilities: { cancel: true },
+			state,
+			...(state === "idle" && ref.status === "aborted" ? { stopReason: "cancelled" as const } : {}),
+		};
+		this.#trackLifetimeDelivery(
+			record,
+			"subagent_update",
+			this.#connection.sessionUpdate({ sessionId: record.protocolSessionId, update }),
+		);
+	}
+
+	#wireChildSession(record: ManagedSessionRecord, ref: AgentRef, child: ChildSessionState): void {
+		const session = ref.session;
+		if (!session) return;
+		child.unsubscribeEvents = session.subscribe(event => {
+			if (event.type === "tool_execution_start" || event.type === "tool_execution_update") {
+				child.toolArgsById.set(event.toolCallId, event.args);
+			}
+			for (const notification of mapAgentSessionEventToAcpSessionUpdates(event, child.protocolSessionId, {
+				getToolArgs: toolCallId => child.toolArgsById.get(toolCallId),
+				// No cwd: child paths (possibly isolated-worktree relative) pass
+				// through raw rather than being resolved against the parent's cwd.
+				resolveImageData: data => resolveImageDataSync(this.#blobs, data),
+				subagentCards: child.tracker,
+			})) {
+				void this.#connection.sessionUpdate(notification).catch(error => {
+					logger.warn("Failed to stream ACP child session update", { agentId: child.agentId, error });
+				});
+			}
+			if (event.type === "tool_execution_end") {
+				child.toolArgsById.delete(event.toolCallId);
+			}
+		});
+		child.unsubscribeRunState = session.subscribeRunState(state => {
+			const ref = AgentRegistry.global().get(child.agentId);
+			if (ref) this.#announceChild(record, ref, state);
+		});
+	}
+
+	#detachChildSession(record: ManagedSessionRecord, agentId: string): void {
+		const child = record.childSessions.get(agentId);
+		if (!child) return;
+		child.unsubscribeEvents?.();
+		child.unsubscribeEvents = undefined;
+		child.unsubscribeRunState?.();
+		child.unsubscribeRunState = undefined;
+		record.childSessions.delete(agentId);
+		this.#childSessionsByProtocolId.delete(child.protocolSessionId);
 	}
 
 	#handleLifetimeEvent(record: ManagedSessionRecord, event: AgentSessionEvent): void {
@@ -2217,6 +2372,17 @@ export class AcpAgent implements Agent {
 			(event.type === "tool_execution_update" || event.type === "tool_execution_end") &&
 			(event.toolName === "task" || event.toolName === "wait")
 		) {
+			// Progress rows carry the registry ids of this session's task children:
+			// a child whose live session attached after registration is wired here,
+			// because `attachSession` emits no registry event.
+			const rows = extractSubagentProgressRows(
+				event.type === "tool_execution_update" ? event.partialResult : event.result,
+			);
+			for (const row of rows) {
+				if (typeof row.id !== "string") continue;
+				const ref = AgentRegistry.global().get(row.id);
+				if (ref && this.#isManagedChildAgent(record, ref)) this.#syncChildSession(record, ref);
+			}
 			this.#deliverSupervisorTitle(record);
 		}
 		this.#clearLiveAssistantMessageAfterEvent(record, event);
@@ -3632,6 +3798,14 @@ export class AcpAgent implements Agent {
 	}
 
 	async #disposeSessionRecord(record: ManagedSessionRecord, reason?: postmortem.Reason): Promise<void> {
+		record.registryUnsubscribe?.();
+		record.registryUnsubscribe = undefined;
+		for (const child of record.childSessions.values()) {
+			child.unsubscribeEvents?.();
+			child.unsubscribeRunState?.();
+			this.#childSessionsByProtocolId.delete(child.protocolSessionId);
+		}
+		record.childSessions.clear();
 		record.lifetimeUnsubscribe?.();
 		record.commandMetadataUnsubscribe?.();
 		record.pendingCompactionNotifications = undefined;

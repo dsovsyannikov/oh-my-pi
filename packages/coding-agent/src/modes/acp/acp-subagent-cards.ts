@@ -84,6 +84,17 @@ interface SubagentCard {
  */
 export class SubagentCardTracker {
 	#cards = new Map<string, SubagentCard>();
+	readonly #emitCards: boolean;
+
+	/**
+	 * `emitCards: false` (child-session mode): progress and settlement rows still
+	 * update the internal state — so the supervisor title keeps its live rollup —
+	 * but no card notifications are produced; the child sessions themselves carry
+	 * the visible content.
+	 */
+	constructor(options: { emitCards?: boolean } = {}) {
+		this.#emitCards = options.emitCards ?? true;
+	}
 
 	/** Non-terminal card count (running or queued subagents). */
 	get activeCount(): number {
@@ -152,10 +163,10 @@ export class SubagentCardTracker {
 			if (!card.created) {
 				card.created = true;
 				card.lastTitle = title;
-				notifications.push(toNotification(sessionId, buildCardCreate(card, row)));
+				if (this.#emitCards) notifications.push(toNotification(sessionId, buildCardCreate(card, row)));
 			} else if (title !== card.lastTitle) {
 				card.lastTitle = title;
-				notifications.push(toNotification(sessionId, buildCardUpdate(card, title, row)));
+				if (this.#emitCards) notifications.push(toNotification(sessionId, buildCardUpdate(card, title, row)));
 			}
 		}
 		return notifications;
@@ -193,10 +204,10 @@ export class SubagentCardTracker {
 			if (!card.created) {
 				card.created = true;
 				card.lastTitle = title;
-				notifications.push(toNotification(sessionId, buildCardCreate(card, row)));
+				if (this.#emitCards) notifications.push(toNotification(sessionId, buildCardCreate(card, row)));
 			} else {
 				card.lastTitle = title;
-				notifications.push(toNotification(sessionId, buildCardUpdate(card, title, row)));
+				if (this.#emitCards) notifications.push(toNotification(sessionId, buildCardUpdate(card, title, row)));
 			}
 		}
 		return notifications;
@@ -211,6 +222,7 @@ export class SubagentCardTracker {
 		const notifications: SessionNotification[] = [];
 		for (const card of this.#cards.values()) {
 			if (isTerminalStatus(card.status) || !card.created) continue;
+			if (!this.#emitCards) continue;
 			const marker = " — background";
 			if (card.lastTitle && !card.lastTitle.endsWith(marker)) {
 				const title = clipTitle(`${card.lastTitle}${marker}`);
@@ -228,6 +240,10 @@ export class SubagentCardTracker {
 		const notifications: SessionNotification[] = [];
 		for (const card of this.#cards.values()) {
 			if (card.parentToolCallId !== parentToolCallId || isTerminalStatus(card.status)) continue;
+			if (!this.#emitCards) {
+				card.status = "failed";
+				continue;
+			}
 			card.status = "failed";
 			const title = clipTitle(`${card.agent} — failed: ${clipText(reason, 60)}`);
 			card.lastTitle = title;
@@ -253,6 +269,10 @@ export class SubagentCardTracker {
 		const notifications: SessionNotification[] = [];
 		for (const card of this.#cards.values()) {
 			if (isTerminalStatus(card.status) || !card.created) continue;
+			if (!this.#emitCards) {
+				card.status = "failed";
+				continue;
+			}
 			card.status = "failed";
 			const title = clipTitle(`${card.agent} — cancelled`);
 			card.lastTitle = title;

@@ -77,6 +77,7 @@ const SessionUpdate = type({
 	.or({ sessionUpdate: "'available_commands_update'", availableCommands: "unknown[]" })
 	.or({ sessionUpdate: "'config_option_update'", configOptions: "unknown[]" })
 	.or({ sessionUpdate: "'session_info_update'", "title?": "string | null | undefined" })
+	.or({ sessionUpdate: "'subagent_update'", sessionId: "string" })
 	.or({ sessionUpdate: "'usage_update'", size: "number", used: "number" });
 
 /** Validator for new-session responses. */

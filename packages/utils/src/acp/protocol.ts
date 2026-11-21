@@ -149,6 +149,8 @@ export interface ClientCapabilities {
 	terminal?: boolean;
 	auth?: { terminal?: boolean };
 	elicitation?: { form?: Record<string, unknown>; url?: Record<string, unknown> };
+	/** Marker for the Subagent Sessions RFD: the client renders announced child sessions. */
+	subagents?: Record<string, unknown>;
 	_meta?: Record<string, unknown>;
 }
 /** Implementation identity sent during initialization. */
@@ -331,6 +333,7 @@ export type SessionUpdate =
 	| ({ sessionUpdate: "config_option_update"; configOptions: SessionConfigOption[] } & Meta)
 	| ({ sessionUpdate: "available_commands_update"; availableCommands: AvailableCommand[] } & Meta)
 	| ({ sessionUpdate: "session_info_update"; title?: string | null; updatedAt?: string | null } & Meta)
+	| ({ sessionUpdate: "subagent_update" } & SubagentUpdate)
 	| ({
 			sessionUpdate: "usage_update";
 			size: number;
@@ -341,6 +344,25 @@ export type SessionUpdate =
 export interface SessionNotification extends Meta {
 	sessionId: SessionId;
 	update: SessionUpdate;
+}
+/**
+ * Announce or patch a child (subagent) session, sent on the PARENT's sessionId
+ * (ACP Subagent Sessions RFD). The first frame for a child sessionId announces
+ * it; later frames patch the provided fields (omitted fields keep their value).
+ * Child content streams as ordinary session updates on the child's own
+ * sessionId and must always arrive after its announcement.
+ */
+export interface SubagentUpdate extends Meta {
+	/** Stable client-visible id of the child session. */
+	sessionId: string;
+	title?: string | null;
+	description?: string | null;
+	capabilities?: { cancel?: boolean } | null;
+	state?: "running" | "requires_action" | "idle" | "unknown" | null;
+	/** Why the child went idle; only meaningful together with `state: "idle"`. */
+	stopReason?: "end_turn" | "cancelled" | "error" | "max_tokens" | "max_turn_requests" | "refusal" | null;
+	cwd?: string | null;
+	additionalDirectories?: string[] | null;
 }
 /** Prompt request. */
 export interface PromptRequest extends Meta {
