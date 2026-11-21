@@ -8,6 +8,14 @@ import type {
 	ToolCallLocation,
 	ToolKind,
 } from "@oh-my-pi/pi-utils/acp";
+import {
+	buildTaskCallTitle,
+	buildTaskResultSummary,
+	extractSubagentAsyncState,
+	extractSubagentProgressRows,
+	extractSubagentResultRows,
+} from "./acp-subagent-cards";
+import type { SubagentCardTracker } from "./acp-subagent-cards";
 import { InternalUrlRouter } from "../../internal-urls/router";
 import { extractUriScheme } from "../../internal-urls/parse";
 import type { SchemeSpec } from "../../internal-urls/types";
@@ -33,6 +41,14 @@ interface AcpEventMapperOptions {
 	 * before emitting `ToolCallLocation` entries.
 	 */
 	cwd?: string;
+	/**
+	 * Per-session tracker for live subagent cards. When set, `task` progress rows
+	 * become one tool_call card per subagent (`toolCallId: "subagent:<id>"`) and
+	 * `wait` rows refresh those cards; task cards also stop serializing their
+	 * progress/results JSON into the card body. Without it, task/wait frames fall
+	 * through to the generic tool-call rendering.
+	 */
+	subagentCards?: SubagentCardTracker;
 }
 
 interface ContentArrayContainer {
@@ -209,52 +225,26 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 		}
 		case "tool_execution_update": {
 			if (isInternalAgentMessageTool(event.toolName, event.args)) return [];
-			const content = mergeToolUpdateContent(
-				buildToolStartContent(event.toolName, event.args),
-				extractToolCallContent(event.partialResult, options),
-			);
-			const update: SessionUpdate = {
-				sessionUpdate: "tool_call_update",
-				toolCallId: event.toolCallId,
-				status: toolUpdateStatus(event.partialResult),
-				rawOutput: event.partialResult,
-			};
-			if (content.length > 0) {
-				update.content = content;
+			if (event.toolName === "task") {
+				return mapTaskExecutionUpdate(event, sessionId, options);
 			}
-			const locations = extractToolLocations(event.args, options.cwd, event.toolName);
-			if (locations.length > 0) {
-				update.locations = locations;
+			const cardNotifications = syncWaitSubagentCards(event.toolName, event.partialResult, sessionId, options);
+			if (cardNotifications.length > 0) {
+				return [...mapGenericToolExecutionUpdate(event, sessionId, options), ...cardNotifications];
 			}
-			return [toSessionNotification(sessionId, update)];
+			return mapGenericToolExecutionUpdate(event, sessionId, options);
 		}
 		case "tool_execution_end": {
 			const args = getToolExecutionEndArgs(event, options);
 			if (isInternalAgentMessageTool(event.toolName, args)) return [];
-			const resultContent = [
-				...extractDiffToolCallContent(event.result),
-				...extractToolCallContent(event.result, options),
-			];
-			const content = mergeToolUpdateContent(buildToolStartContent(event.toolName, args), resultContent);
-			const update: SessionUpdate = {
-				sessionUpdate: "tool_call_update",
-				toolCallId: event.toolCallId,
-				status: event.isError ? "failed" : "completed",
-				rawOutput: event.result,
-			};
-			if (content.length > 0) {
-				update.content = content;
+			if (event.toolName === "task") {
+				return mapTaskExecutionEnd(event, sessionId, options);
 			}
-			const locations = extractToolLocationsFromResult(event.result, options.cwd);
-			if (locations.length > 0) {
-				update.locations = locations;
+			const cardNotifications = syncWaitSubagentCards(event.toolName, event.result, sessionId, options);
+			if (cardNotifications.length > 0) {
+				return [...mapGenericToolExecutionEnd(event, sessionId, options, args), ...cardNotifications];
 			}
-			const notifications = [toSessionNotification(sessionId, update)];
-			const planUpdate = mapTodoResultToPlanUpdate(event);
-			if (planUpdate) {
-				notifications.push(toSessionNotification(sessionId, planUpdate));
-			}
-			return notifications;
+			return mapGenericToolExecutionEnd(event, sessionId, options, args);
 		}
 		case "todo_reminder": {
 			const entries = event.todos.map(todo => ({
@@ -486,6 +476,148 @@ export function buildToolCallStartUpdate(input: {
 	return update;
 }
 
+function mapGenericToolExecutionUpdate(
+	event: Extract<AgentSessionEvent, { type: "tool_execution_update" }>,
+	sessionId: string,
+	options: AcpEventMapperOptions,
+): SessionNotification[] {
+	const content = mergeToolUpdateContent(
+		buildToolStartContent(event.toolName, event.args),
+		extractToolCallContent(event.partialResult, options),
+	);
+	const update: SessionUpdate = {
+		sessionUpdate: "tool_call_update",
+		toolCallId: event.toolCallId,
+		status: toolUpdateStatus(event.partialResult),
+		rawOutput: event.partialResult,
+	};
+	if (content.length > 0) {
+		update.content = content;
+	}
+	const locations = extractToolLocations(event.args, options.cwd, event.toolName);
+	if (locations.length > 0) {
+		update.locations = locations;
+	}
+	return [toSessionNotification(sessionId, update)];
+}
+
+function mapGenericToolExecutionEnd(
+	event: Extract<AgentSessionEvent, { type: "tool_execution_end" }>,
+	sessionId: string,
+	options: AcpEventMapperOptions,
+	args: unknown,
+): SessionNotification[] {
+	const resultContent = [
+		...extractDiffToolCallContent(event.result),
+		...extractToolCallContent(event.result, options),
+	];
+	const content = mergeToolUpdateContent(buildToolStartContent(event.toolName, args), resultContent);
+	const update: SessionUpdate = {
+		sessionUpdate: "tool_call_update",
+		toolCallId: event.toolCallId,
+		status: event.isError ? "failed" : "completed",
+		rawOutput: event.result,
+	};
+	if (content.length > 0) {
+		update.content = content;
+	}
+	const locations = extractToolLocationsFromResult(event.result, options.cwd);
+	if (locations.length > 0) {
+		update.locations = locations;
+	}
+	const notifications = [toSessionNotification(sessionId, update)];
+	const planUpdate = mapTodoResultToPlanUpdate(event);
+	if (planUpdate) {
+		notifications.push(toSessionNotification(sessionId, planUpdate));
+	}
+	return notifications;
+}
+
+/**
+ * `task` progress frames carry `AgentProgress[]` rows for every live subagent.
+ * The parent card updates status-only (no progress JSON in the card body) while
+ * the per-subagent cards carry the detail.
+ */
+function mapTaskExecutionUpdate(
+	event: Extract<AgentSessionEvent, { type: "tool_execution_update" }>,
+	sessionId: string,
+	options: AcpEventMapperOptions,
+): SessionNotification[] {
+	const notifications: SessionNotification[] = [
+		toSessionNotification(sessionId, {
+			sessionUpdate: "tool_call_update",
+			toolCallId: event.toolCallId,
+			status: toolUpdateStatus(event.partialResult),
+			rawOutput: event.partialResult,
+		}),
+	];
+	const rows = extractSubagentProgressRows(event.partialResult);
+	if (rows.length > 0 && options.subagentCards) {
+		notifications.push(...options.subagentCards.sync(sessionId, rows, event.toolCallId));
+	}
+	return notifications;
+}
+
+/**
+ * `task` settlement: finalize every subagent card from `SingleResult[]` rows and
+ * replace the JSON blob the generic path would render with a one-line-per-agent
+ * summary. Background async jobs keep their cards live instead — they settle
+ * through later wait frames.
+ */
+function mapTaskExecutionEnd(
+	event: Extract<AgentSessionEvent, { type: "tool_execution_end" }>,
+	sessionId: string,
+	options: AcpEventMapperOptions,
+): SessionNotification[] {
+	const cards = options.subagentCards;
+	const results = extractSubagentResultRows(event.result);
+	const asyncState = extractSubagentAsyncState(event.result);
+	let status: "in_progress" | "completed" | "failed" = event.isError ? "failed" : "completed";
+	let content: ToolCallContent[] = [];
+	const notifications: SessionNotification[] = [];
+	if (asyncState === "running") {
+		status = "in_progress";
+		content = [textToolCallContent(`Running in background (${results.length} agents) — poll with wait`)];
+		const rows = extractSubagentProgressRows(event.result);
+		if (rows.length > 0 && cards) {
+			notifications.push(...cards.sync(sessionId, rows, event.toolCallId));
+		}
+	} else {
+		if (cards && results.length > 0) {
+			notifications.push(...cards.finalizeFromResults(sessionId, results));
+		} else if (cards && event.isError) {
+			notifications.push(...cards.failParent(sessionId, event.toolCallId, "task call failed"));
+		}
+		if (results.length > 0 && !event.isError) {
+			content = [textToolCallContent(buildTaskResultSummary(results))];
+		}
+	}
+	const update: SessionUpdate = {
+		sessionUpdate: "tool_call_update",
+		toolCallId: event.toolCallId,
+		status,
+		rawOutput: event.result,
+	};
+	if (content.length > 0) {
+		update.content = content;
+	}
+	notifications.unshift(toSessionNotification(sessionId, update));
+	return notifications;
+}
+
+/** Route `wait` frames' progress rows into the live subagent cards (no parent binding). */
+function syncWaitSubagentCards(
+	toolName: string,
+	value: unknown,
+	sessionId: string,
+	options: AcpEventMapperOptions,
+): SessionNotification[] {
+	if (toolName !== "wait" || !options.subagentCards) return [];
+	const rows = extractSubagentProgressRows(value);
+	if (rows.length === 0) return [];
+	return options.subagentCards.sync(sessionId, rows);
+}
+
 export function normalizeReplayToolArguments(value: unknown): { args: unknown } {
 	if (typeof value !== "string") {
 		return { args: value ?? {} };
@@ -586,6 +718,13 @@ function buildToolTitle(toolName: string, args: unknown, intent: string | undefi
 	}
 	const trimmedIntent =
 		intent?.trim() || extractStringProperty<Record<typeof INTENT_FIELD, string>>(args, INTENT_FIELD)?.trim();
+	if (trimmedIntent) {
+		return toolIntentLabel(trimmedIntent);
+	}
+	if (toolName === "task") {
+		const taskTitle = buildTaskCallTitle(args);
+		if (taskTitle) return taskTitle;
+	}
 	if (trimmedIntent) {
 		return toolIntentLabel(trimmedIntent);
 	}

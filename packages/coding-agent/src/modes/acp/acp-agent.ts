@@ -110,6 +110,7 @@ import {
 	mapAgentSessionEventToAcpSessionUpdates,
 	normalizeReplayToolArguments,
 } from "./acp-event-mapper";
+import { SubagentCardTracker } from "./acp-subagent-cards";
 import { ACP_TERMINAL_AUTH_FLAG } from "./terminal-auth";
 
 import { cfgDisabledExtensions, cfgExtensions } from "../../extensibility/settings";
@@ -406,6 +407,10 @@ type ManagedSessionRecord = {
 	liveMessageId: string | undefined;
 	liveMessageProgress: { textEmitted: boolean; thoughtEmitted: boolean } | undefined;
 	toolArgsById: Map<string, unknown>;
+	// Live subagent cards for task/wait progress — the ACP stand-in for the TUI's
+	// Agent Hub rows. Session-scoped (not turn-scoped): background async subagents
+	// keep their cards across turns, and history replay settles them in final state.
+	subagentCards: SubagentCardTracker;
 	extensionsConfigured: boolean;
 	// Capture at registration, independently of prompt turns. Delivery opens
 	// after the bootstrap guard or a client prompt proves the session is known.
@@ -1541,6 +1546,13 @@ export class AcpAgent implements Agent {
 
 	async cancel(params: { sessionId: string }): Promise<void> {
 		const record = this.#getSessionRecord(params.sessionId);
+		// Settle the subagent cards: cancelled sync children never get to report
+		// their aborted status (the prompt-turn subscription is torn down first), so
+		// mark them here — a background job that survives the cancel resurrects its
+		// card on the next progress row.
+		for (const notification of record.subagentCards.abortAll(record.protocolSessionId)) {
+			await this.#connection.sessionUpdate(notification);
+		}
 		// Stop means stop everything accepted on this session: prompts still
 		// inside the dispatch window or queued behind the running turn must not
 		// stream after the client believes it stopped the session.
@@ -1987,6 +1999,7 @@ export class AcpAgent implements Agent {
 			liveMessageId: undefined,
 			liveMessageProgress: undefined,
 			toolArgsById: new Map(),
+			subagentCards: new SubagentCardTracker(),
 			extensionsConfigured: false,
 			closedError: undefined,
 			promptEventHandlers: new Set(),
@@ -2135,6 +2148,7 @@ export class AcpAgent implements Agent {
 			getToolArgs: toolCallId => record.toolArgsById.get(toolCallId),
 			cwd: record.session.sessionManager.getCwd(),
 			resolveImageData: resolveImageDataForAcp,
+			subagentCards: record.subagentCards,
 		})) {
 			const delivery = this.#connection.sessionUpdate(notification);
 			if (streamedAssistantError) {
@@ -2158,6 +2172,11 @@ export class AcpAgent implements Agent {
 			await this.#flushMissedFinalAssistantText(record, event);
 			await this.#flushUnreportedTurnError(record, event);
 			await this.#emitEndOfTurnUpdates(record);
+			// Subagents still running at turn end are background async jobs: keep
+			// their cards in_progress but mark them as running outside the turn.
+			for (const notification of record.subagentCards.finalizeTurn(record.protocolSessionId)) {
+				await this.#connection.sessionUpdate(notification);
+			}
 			await this.#waitForAcpPromptIdle(record, promptTurn);
 			// A follow-up turn's `agent_end` handler can settle the prompt first; this
 			// handler must not then reset or settle the next prompt's state.
@@ -3029,6 +3048,7 @@ export class AcpAgent implements Agent {
 				cwd,
 				replayedToolCallIds,
 				replayedToolCallArgs,
+				record.subagentCards,
 			)) {
 				await this.#connection.sessionUpdate(notification);
 			}
@@ -3041,9 +3061,17 @@ export class AcpAgent implements Agent {
 		cwd: string,
 		replayedToolCallIds: Set<string>,
 		replayedToolCallArgs: Map<string, unknown>,
+		subagentCards: SubagentCardTracker,
 	): SessionNotification[] {
 		if (message.role === "assistant") {
-			return this.#replayAssistantMessage(sessionId, message, cwd, replayedToolCallIds, replayedToolCallArgs);
+			return this.#replayAssistantMessage(
+				sessionId,
+				message,
+				cwd,
+				replayedToolCallIds,
+				replayedToolCallArgs,
+				subagentCards,
+			);
 		}
 		if (
 			message.role === "user" ||
@@ -3074,6 +3102,7 @@ export class AcpAgent implements Agent {
 				{
 					includeStart: !replayedToolCallIds.has(message.toolCallId),
 					toolArgs: replayedToolCallArgs.get(message.toolCallId),
+					subagentCards,
 				},
 			);
 		}
@@ -3098,6 +3127,7 @@ export class AcpAgent implements Agent {
 		cwd: string,
 		replayedToolCallIds: Set<string>,
 		replayedToolCallArgs: Map<string, unknown>,
+		subagentCards: SubagentCardTracker,
 	): SessionNotification[] {
 		const notifications: SessionNotification[] = [];
 		const messageId = crypto.randomUUID();
@@ -3163,7 +3193,7 @@ export class AcpAgent implements Agent {
 								args,
 							},
 							sessionId,
-							{ cwd },
+							{ cwd, subagentCards },
 						),
 					);
 					replayedToolCallIds.add(toolItem.id);
@@ -3198,7 +3228,7 @@ export class AcpAgent implements Agent {
 		sessionId: string,
 		cwd: string,
 		message: Required<Pick<ReplayableMessage, "toolCallId" | "toolName">> & ReplayableMessage,
-		options: { includeStart?: boolean; toolArgs?: unknown } = {},
+		options: { includeStart?: boolean; toolArgs?: unknown; subagentCards?: SubagentCardTracker } = {},
 	): SessionNotification[] {
 		const args = this.#buildReplayToolArgs(message.details);
 		const startEvent: AgentSessionEvent = {
@@ -3222,11 +3252,18 @@ export class AcpAgent implements Agent {
 			cwd,
 			getToolArgs: toolCallId => (toolCallId === message.toolCallId ? options.toolArgs : undefined),
 			resolveImageData: (data, _mimeType) => resolveImageDataSync(this.#blobs, data),
+			subagentCards: options.subagentCards,
 		});
 		if (options.includeStart === false) {
 			return notifications;
 		}
-		return [...mapAgentSessionEventToAcpSessionUpdates(startEvent, sessionId, { cwd }), ...notifications];
+		return [
+			...mapAgentSessionEventToAcpSessionUpdates(startEvent, sessionId, {
+				cwd,
+				subagentCards: options.subagentCards,
+			}),
+			...notifications,
+		];
 	}
 
 	#buildReplayToolArgs(details: unknown): { path?: string } {
