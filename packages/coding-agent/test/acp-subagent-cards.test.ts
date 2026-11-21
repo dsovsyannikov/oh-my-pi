@@ -144,15 +144,34 @@ describe("SubagentCardTracker", () => {
 	});
 });
 
+describe("supervisor summary", () => {
+	it("rolls up active subagents and ignores settled ones", () => {
+		const tracker = new SubagentCardTracker();
+		tracker.sync(SESSION, [
+			progressRow(),
+			progressRow({ id: "ag-2", agent: "planner", stage: "drafting", tokens: 600 }),
+		]);
+		expect(tracker.supervisorSummary()).toEqual({ active: 2, tokens: 4800, focus: "scout: reading files" });
+		tracker.finalizeFromResults(SESSION, [resultRow(), resultRow({ id: "ag-2", agent: "planner" })]);
+		expect(tracker.supervisorSummary()).toBeUndefined();
+	});
+
+	it("falls back to the task label when the stage is unknown", () => {
+		const tracker = new SubagentCardTracker();
+		tracker.sync(SESSION, [progressRow({ stage: undefined, lastIntent: undefined })]);
+		expect(tracker.supervisorSummary()?.focus).toBe("scout: Research configs");
+	});
+});
+
 describe("task call titles", () => {
-		it("titles a flat spawn", () => {
-			const update = buildToolCallStartUpdate({
-				toolCallId: "call-1",
-				toolName: "task",
-				args: { agent: "scout", task: "Research the config layer\nsecond line" },
-			}) as { title: string };
-			expect(update.title).toBe("task: scout — Research the config layer");
-		});
+	it("titles a flat spawn", () => {
+		const update = buildToolCallStartUpdate({
+			toolCallId: "call-1",
+			toolName: "task",
+			args: { agent: "scout", task: "Research the config layer\nsecond line" },
+		}) as { title: string };
+		expect(update.title).toBe("task: scout — Research the config layer");
+	});
 
 	it("titles the default agent without repeating 'task'", () => {
 		expect(buildTaskCallTitle({ agent: "task", task: "Fix the flaky test" })).toBe("task: Fix the flaky test");

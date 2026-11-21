@@ -72,6 +72,9 @@ interface SubagentCard {
 	status: SubagentCardStatus;
 	created: boolean;
 	lastTitle: string | undefined;
+	/** Latest live detail for the supervisor title (`focus` line). */
+	stage: string | undefined;
+	tokens: number | undefined;
 }
 
 /**
@@ -89,6 +92,25 @@ export class SubagentCardTracker {
 			if (!isTerminalStatus(card.status)) count++;
 		}
 		return count;
+	}
+
+	/**
+	 * Live rollup for the supervisor channel (the thread title in the editor's
+	 * session list): how many subagents run, their combined token burn, and the
+	 * focus line of the first active subagent. `undefined` when nothing runs.
+	 */
+	supervisorSummary(): { active: number; tokens: number; focus: string } | undefined {
+		let active = 0;
+		let tokens = 0;
+		let focus: string | undefined;
+		for (const card of this.#cards.values()) {
+			if (isTerminalStatus(card.status)) continue;
+			active++;
+			tokens += card.tokens ?? 0;
+			focus ??= `${card.agent}: ${card.stage ?? card.label}`;
+		}
+		if (active === 0) return undefined;
+		return { active, tokens, focus: clipTitle(focus ?? "subagents") };
 	}
 
 	/**
@@ -113,6 +135,8 @@ export class SubagentCardTracker {
 					status: nextStatus,
 					created: false,
 					lastTitle: undefined,
+					stage: asString(row.stage) ?? asString(row.lastIntent),
+					tokens: asNumber(row.tokens),
 				};
 				this.#cards.set(id, card);
 			} else {
@@ -121,6 +145,8 @@ export class SubagentCardTracker {
 					if (isTerminalStatus(nextStatus)) continue;
 				}
 				card.status = nextStatus;
+				card.stage = asString(row.stage) ?? asString(row.lastIntent);
+				card.tokens = asNumber(row.tokens);
 			}
 			const title = buildRunningTitle(card, row);
 			if (!card.created) {
@@ -156,6 +182,8 @@ export class SubagentCardTracker {
 					status,
 					created: false,
 					lastTitle: undefined,
+					stage: undefined,
+					tokens: asNumber(row.tokens),
 				};
 				this.#cards.set(id, card);
 			} else {
@@ -535,10 +563,12 @@ function fmtDuration(ms: number | undefined): string | undefined {
 	return `${hours}h${String(minutes % 60).padStart(2, "0")}m`;
 }
 
-function fmtTokens(tokens: number): string {
+export function formatTokens(tokens: number): string {
 	if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(1).replace(/\.0$/, "")}k`;
 	return `${tokens}`;
 }
+
+const fmtTokens = formatTokens;
 
 function fmtCost(cost: number): string {
 	return `$${cost >= 1 ? cost.toFixed(2) : cost.toFixed(3)}`;

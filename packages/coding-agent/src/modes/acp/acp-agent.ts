@@ -110,7 +110,7 @@ import {
 	mapAgentSessionEventToAcpSessionUpdates,
 	normalizeReplayToolArguments,
 } from "./acp-event-mapper";
-import { SubagentCardTracker } from "./acp-subagent-cards";
+import { formatTokens, SubagentCardTracker } from "./acp-subagent-cards";
 import { ACP_TERMINAL_AUTH_FLAG } from "./terminal-auth";
 
 import { cfgDisabledExtensions, cfgExtensions } from "../../extensibility/settings";
@@ -411,6 +411,10 @@ type ManagedSessionRecord = {
 	// Agent Hub rows. Session-scoped (not turn-scoped): background async subagents
 	// keep their cards across turns, and history replay settles them in final state.
 	subagentCards: SubagentCardTracker;
+	// Supervisor channel state: the conversation excerpt this thread is known by
+	// and the last status title pushed for it (see #deliverSupervisorTitle).
+	titleBase: string | undefined;
+	lastSupervisorTitle: string | undefined;
 	extensionsConfigured: boolean;
 	// Capture at registration, independently of prompt turns. Delivery opens
 	// after the bootstrap guard or a client prompt proves the session is known.
@@ -1232,6 +1236,19 @@ export class AcpAgent implements Agent {
 	async prompt(params: PromptRequest): Promise<PromptResponse> {
 		const record = this.#getSessionRecord(params.sessionId);
 		this.#activateLifetimeUpdates(record);
+		if (record.titleBase === undefined) {
+			for (const block of params.prompt) {
+				if (block.type === "text" && block.text.trim().length > 0) {
+					const line = block.text.trim().split("\n", 1)[0].trim();
+					record.titleBase = line.length > 60 ? `${line.slice(0, 59)}…` : line;
+					break;
+				}
+			}
+		}
+		// Every prompt self-heals the supervisor title: subagents settled since the
+		// last turn restore the conversation title here instead of leaving a stale
+		// status in the session list.
+		this.#deliverSupervisorTitle(record);
 		const activeTurn = record.promptTurn;
 		// A `_session/steering` refusal (`promptRequired`) now only ever
 		// happens while no client prompt owns the turn (idle, or an
@@ -1553,6 +1570,7 @@ export class AcpAgent implements Agent {
 		for (const notification of record.subagentCards.abortAll(record.protocolSessionId)) {
 			await this.#connection.sessionUpdate(notification);
 		}
+		this.#deliverSupervisorTitle(record);
 		// Stop means stop everything accepted on this session: prompts still
 		// inside the dispatch window or queued behind the running turn must not
 		// stream after the client believes it stopped the session.
@@ -2000,6 +2018,8 @@ export class AcpAgent implements Agent {
 			liveMessageProgress: undefined,
 			toolArgsById: new Map(),
 			subagentCards: new SubagentCardTracker(),
+			titleBase: undefined,
+			lastSupervisorTitle: undefined,
 			extensionsConfigured: false,
 			closedError: undefined,
 			promptEventHandlers: new Set(),
@@ -2010,6 +2030,33 @@ export class AcpAgent implements Agent {
 			lifetimeUpdatesReady: false,
 			pendingCompactionNotifications: undefined,
 		};
+	}
+
+	/**
+	 * Supervisor channel (interface layer 3): while subagents run, the thread
+	 * title in the editor's session list carries their live rollup
+	 * (`⟳ N agents · T tok · agent: stage`) — the sidebar becomes a supervisor
+	 * list without the client implementing one. Idle threads are never touched,
+	 * so Zed's own title derivation stays authoritative; once the subagents
+	 * settle, the conversation title is restored.
+	 */
+	#deliverSupervisorTitle(record: ManagedSessionRecord): void {
+		const summary = record.subagentCards.supervisorSummary();
+		const desired = summary
+			? `⟳ ${summary.active} ${summary.active === 1 ? "agent" : "agents"} · ${formatTokens(summary.tokens)} tok · ${summary.focus}`
+			: record.lastSupervisorTitle !== undefined
+				? record.titleBase
+				: undefined;
+		if (desired === undefined || desired === record.lastSupervisorTitle) return;
+		record.lastSupervisorTitle = desired;
+		this.#trackLifetimeDelivery(
+			record,
+			"session_info_update",
+			this.#connection.sessionUpdate({
+				sessionId: record.protocolSessionId,
+				update: { sessionUpdate: "session_info_update", title: desired },
+			}),
+		);
 	}
 
 	#handleLifetimeEvent(record: ManagedSessionRecord, event: AgentSessionEvent): void {
@@ -2166,6 +2213,12 @@ export class AcpAgent implements Agent {
 		if (event.type === "tool_execution_end") {
 			record.toolArgsById.delete(event.toolCallId);
 		}
+		if (
+			(event.type === "tool_execution_update" || event.type === "tool_execution_end") &&
+			(event.toolName === "task" || event.toolName === "wait")
+		) {
+			this.#deliverSupervisorTitle(record);
+		}
 		this.#clearLiveAssistantMessageAfterEvent(record, event);
 
 		if (event.type === "agent_end") {
@@ -2177,6 +2230,7 @@ export class AcpAgent implements Agent {
 			for (const notification of record.subagentCards.finalizeTurn(record.protocolSessionId)) {
 				await this.#connection.sessionUpdate(notification);
 			}
+			this.#deliverSupervisorTitle(record);
 			await this.#waitForAcpPromptIdle(record, promptTurn);
 			// A follow-up turn's `agent_end` handler can settle the prompt first; this
 			// handler must not then reset or settle the next prompt's state.
